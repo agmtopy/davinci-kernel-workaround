@@ -1,0 +1,16 @@
+--- a/techpack/audio/asoc/sm6150.c
++++ b/techpack/audio/asoc/sm6150.c
+@@ -8565,8 +8565,10 @@ static void populate_snd_card_dailinks(struct platform_device *pdev, int hw_platform)
+ 				} else if (HARDWARE_PLATFORM_DAVINCI == hw_platform) {
+ 					dev_info(dev, "%s: hardware is HARDWARE_PLATFORM_DAVINCI.\n", __func__);
+-					msm_mi2s_be_dai_links[0].codec_name = "tfa98xx.3-0034";
+-					msm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-3-34";
++					/* dead-amp workaround: the TFA98xx smart amp does not
++					 * answer on I2C (probe error -5), which blocks the
++					 * whole sound card from registering. Bind the
++					 * PRI_MI2S_RX backend to the always-present stub
++					 * codec instead, so wcd9375 paths (headphone jack,
++					 * earpiece, mic) and BT/USB audio keep working. */
++					msm_mi2s_be_dai_links[0].codec_name = "msm-stub-codec.1";
++					msm_mi2s_be_dai_links[0].codec_dai_name = "msm-stub-rx";
+ 				} else if (HARDWARE_PLATFORM_PHOENIX == hw_platform) {

@@ -1,0 +1,75 @@
+name: Build davinci kernel (dead-amp workaround)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow repo (patch lives here)
+        uses: actions/checkout@v4
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_xiaomi_sm6150.git kernel
+
+      - name: Apply dead-amp workaround (2-line change in machine driver)
+        run: |
+          cd kernel
+          python3 - <<'PYEOF'
+          p = 'techpack/audio/asoc/sm6150.c'
+          src = open(p).read()
+          old = '\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_name = "tfa98xx.3-0034";\n\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-3-34";'
+          new = '\t\t\t\t\t/* dead-amp workaround: TFA98xx I2C dead, bind stub codec so card registers */\n\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_name = "msm-stub-codec.1";\n\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_dai_name = "msm-stub-rx";'
+          n = src.count(old)
+          assert n == 1, f"expected exactly 1 match, got {n} - kernel source changed upstream?"
+          open(p, 'w').write(src.replace(old, new))
+          print("patch applied OK")
+          PYEOF
+
+      - name: Install binutils + AOSP kernel clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            flex bison libssl-dev libncurses-dev bc cpio
+          mkdir -p clang
+          curl -L --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel-build-2023/clang-r487747c.tar.gz" \
+            | tar -xz -C clang
+          ./clang/bin/clang --version
+
+      - name: Configure kernel (sdmsteppe-perf + davinci fragment)
+        run: |
+          cd kernel
+          export PATH=$PWD/../clang/bin:$PATH
+          make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            vendor/sdmsteppe-perf_defconfig
+          ./scripts/kconfig/merge_config.sh -m -O out \
+            arch/arm64/configs/vendor/davinci.config
+          make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            olddefconfig
+          echo "=== config sanity check ==="
+          grep -E "CONFIG_SND_SOC_MSM_STUB|CONFIG_MACH_XIAOMI_DAVINCI|CONFIG_SND_SOC_SM6150|CONFIG_TARGET_PRODUCT_K9A" out/.config || true
+
+      - name: Build Image.gz
+        run: |
+          cd kernel
+          export PATH=$PWD/../clang/bin:$PATH
+          make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            -j$(nproc) Image.gz
+          ls -la out/arch/arm64/boot/Image.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: davinci-Image.gz
+          path: |
+            kernel/out/arch/arm64/boot/Image.gz
+            kernel/out/.config
+          if-no-files-found: error
