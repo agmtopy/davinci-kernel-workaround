@@ -1,71 +1,92 @@
 name: Build davinci kernel (dead-amp workaround)
 
+# Triggers automatically on push so no manual "Run workflow" click is needed.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "davinci-amp-workaround.patch"
+      - ".github/workflows/build-davinci-kernel.yml"
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 22.04 keeps glibc/binutils compatible with the LineageOS clang-12 prebuilt
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
     steps:
       - name: Checkout workflow repo (patch lives here)
         uses: actions/checkout@v4
 
-      - name: Clone kernel source
+      - name: Clone LineageOS kernel source (lineage-23.2)
         run: |
           git clone --depth=1 -b lineage-23.2 \
             https://github.com/LineageOS/android_kernel_xiaomi_sm6150.git kernel
+          cd kernel
+          git log --oneline -1
 
-      - name: Apply dead-amp workaround (2-line change in machine driver)
+      - name: Apply dead-amp workaround
         run: |
           cd kernel
           python3 - <<'PYEOF'
           p = 'techpack/audio/asoc/sm6150.c'
           src = open(p).read()
-          old = '\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_name = "tfa98xx.3-0034";\n\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-3-34";'
-          new = '\t\t\t\t\t/* dead-amp workaround: TFA98xx I2C dead, bind stub codec so card registers */\n\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_name = "msm-stub-codec.1";\n\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_dai_name = "msm-stub-rx";'
+          old = ('\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_name = "tfa98xx.3-0034";\n'
+                 '\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_dai_name = "tfa98xx-aif-3-34";')
+          new = ('\t\t\t\t\t/* dead-amp workaround: TFA98xx does not answer on I2C,\n'
+                 '\t\t\t\t\t * bind the always-present stub codec so the sound card\n'
+                 '\t\t\t\t\t * can still register (headset/earpiece/BT keep working).\n'
+                 '\t\t\t\t\t */\n'
+                 '\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_name = "msm-stub-codec.1";\n'
+                 '\t\t\t\t\tmsm_mi2s_be_dai_links[0].codec_dai_name = "msm-stub-rx";')
           n = src.count(old)
-          assert n == 1, f"expected exactly 1 match, got {n} - kernel source changed upstream?"
+          assert n == 1, f"expected exactly 1 match, got {n} - source layout changed upstream"
           open(p, 'w').write(src.replace(old, new))
           print("patch applied OK")
           PYEOF
+          echo "=== resulting diff ==="
+          git diff --stat
+          git diff | head -40
 
-      - name: Install binutils + AOSP kernel clang
+      - name: Install build deps and LineageOS clang-12 toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            flex bison libssl-dev libncurses-dev bc cpio
-          mkdir -p clang
-          curl -L --retry 3 \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel-build-2023/clang-r487747c.tar.gz" \
-            | tar -xz -C clang
-          ./clang/bin/clang --version
+            bc bison flex libssl-dev libncurses-dev cpio rsync \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          mkdir -p tc
+          curl -fL --retry 3 \
+            "https://codeload.github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b/tar.gz/refs/heads/lineage-20.0" \
+            -o clang.tar.gz
+          tar -xzf clang.tar.gz -C tc --strip-components=1
+          ./tc/bin/clang --version
 
-      - name: Configure kernel (sdmsteppe-perf + davinci fragment)
+      - name: Configure (sdmsteppe-perf_defconfig + davinci fragment)
         run: |
           cd kernel
-          export PATH=$PWD/../clang/bin:$PATH
-          make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            vendor/sdmsteppe-perf_defconfig
-          ./scripts/kconfig/merge_config.sh -m -O out \
-            arch/arm64/configs/vendor/davinci.config
-          make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            olddefconfig
-          echo "=== config sanity check ==="
-          grep -E "CONFIG_SND_SOC_MSM_STUB|CONFIG_MACH_XIAOMI_DAVINCI|CONFIG_SND_SOC_SM6150|CONFIG_TARGET_PRODUCT_K9A" out/.config || true
+          export PATH=$PWD/../tc/bin:$PATH
+          MAKE_ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make $MAKE_ARGS vendor/sdmsteppe-perf_defconfig
+          # apply the device fragment on top (last occurrence wins, then olddefconfig)
+          cat arch/arm64/configs/vendor/davinci.config >> out/.config
+          make $MAKE_ARGS olddefconfig
+          echo "=== config sanity ==="
+          grep -E "CONFIG_MACH_XIAOMI_DAVINCI|CONFIG_SND_SOC_MSM_STUB|CONFIG_TARGET_PRODUCT_K9A|CONFIG_SND_SOC_TAS2563|CONFIG_SND_SOC_AWINIC" out/.config || true
+          echo "=== mi2s dailink defaults in source ==="
+          grep -n -A2 "msm_mi2s_be_dai_links\[\] = {" techpack/audio/asoc/sm6150.c | head -5
 
       - name: Build Image.gz
         run: |
           cd kernel
-          export PATH=$PWD/../clang/bin:$PATH
+          export PATH=$PWD/../tc/bin:$PATH
           make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            -j$(nproc) Image.gz
-          ls -la out/arch/arm64/boot/Image.gz
+            -j"$(nproc)" Image.gz
+          ls -l out/arch/arm64/boot/Image.gz
 
-      - name: Upload artifact
+      - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
           name: davinci-Image.gz
@@ -73,3 +94,4 @@ jobs:
             kernel/out/arch/arm64/boot/Image.gz
             kernel/out/.config
           if-no-files-found: error
+          retention-days: 14

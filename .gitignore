@@ -1,0 +1,5 @@
+*.img
+kernel-orig-Image
+dts-blob.bin
+tc/
+*.tar.gz
